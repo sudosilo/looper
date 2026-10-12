@@ -10,6 +10,8 @@
     including phones running other apps on the same server.
     While the band loop runs, a loop starts on the shared bar line, a new recording is trimmed to whole bars,
     and each pass of the loop is started fresh from the server clock so it cannot drift.
+  ORANGE PHONE: v3 band grooves. Drum and bass presets built from the Looper sound bank, played on the band clock
+    in double time against the band tempo, with a sub bass line in the key of the groove the room is playing.
     A loop follows tempo changes by changing its playback speed.
 -->
 <style>
@@ -232,6 +234,19 @@
     min-width: 92px;
   }
   .band-go.on { border-color: var(--blue); color: var(--blue); }
+  .band-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .band-chip {
+    background: var(--panel-hi);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    padding: 7px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .band-chip.on { border-color: var(--accent); color: var(--accent); }
   .band-trim { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); min-width: 58px; text-align: center; }
 
   /* SECTION LABEL */
@@ -603,6 +618,7 @@
         <span class="band-text" id="band-clock">clock off</span>
       </div>
       <div class="band-row"><span class="band-text" id="band-status">band off</span></div>
+      <div class="band-row"><span class="band-text">GROOVE</span><div class="band-chips" id="band-grooves"></div></div>
       <div class="band-row">
         <span class="band-text">TIMING</span>
         <button class="band-btn" id="band-trim-dn" aria-label="Play earlier">-</button>
@@ -1897,6 +1913,138 @@ function bandPos() {
   return null;
 }
 
+// ============================================================
+//  BAND GROOVES
+//  ORANGE PHONE: v3 drum and bass presets. Each pattern is two band bars of 32 steps,
+//  so it runs in double time against the band tempo. x is a full hit, o is a soft hit.
+//  The bass line uses digits for steps of the minor scale above the root of the room groove.
+// ============================================================
+
+const GROOVE_SCALE = [0, 2, 3, 5, 7, 8, 10, 12, 14, 15];
+// Semitones from A for the root of each room groove, so the sub bass sits in the same key.
+const GROOVE_ROOTS = { 'Pocket': 0, 'Four Floor': 7, 'Half Time': 5, 'Click': 0 };
+const GROOVES = {
+  'TWO STEP': {
+    kick1: 'x.........x.....x.........x.....x.........x.....x.........x..x..',
+    snare1:'....x.......x.......x.......x.......x.......x.......x.......x.o.',
+    hhc:   'x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.x.o.',
+    hho:   '......x.......x.......x.......x.......x.......x.......x.......x.',
+    bass:  '0.........0.....0.......3...2...0.........0.....5.......4...3...'
+  },
+  'AMEN': {
+    kick1: 'x.x.......xx....x.x.......x.....x.x.......xx....x.x.......x..x..',
+    snare1:'....x..o.o..x..o....x..o.o....x.....x..o.o..x..o....x..o.o..x.xo',
+    ride:  'x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.x.',
+    crash: 'x...............................................................',
+    bass:  '0.....0...0.......0.....3.......0.....0...0.......5.....4...3...'
+  },
+  'ROLLER': {
+    kick3: 'x.........x...x.x.........x.....x.........x...x.x.........x..x..',
+    snare1:'....x..o....x.......x..o....x.......x..o....x.......x..o....x...',
+    hhc:   'xoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxo',
+    shaker:'..x...x...x...x...x...x...x...x...x...x...x...x...x...x...x...x.',
+    bass:  '0.0...0.0...0...0.0...0.0...3...0.0...0.0...0...0.0...5.4...3...'
+  },
+  'LIQUID': {
+    kick1: 'x.........x.....x.........x.....x.........x.....x.........x.....',
+    snare3:'....x.......x.......x.......x.......x.......x.......x.......x...',
+    clap:  '....o.......o.......o.......o.......o.......o.......o.......o...',
+    shaker:'xoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxoxo',
+    ride:  '..x...x...x...x...x...x...x...x...x...x...x...x...x...x...x...x.',
+    bass:  '0...............4...........3...2...............5.......4.......'
+  },
+  'HALFTIME': {
+    kick3: 'x.....................x.........x.................x.....x.......',
+    snare1:'................x...............................x...............',
+    hhc:   'x...x...x...x...x...x...x...x...x...x...x...x...x...x...x...x...',
+    hho:   '..............x...............x...............x.............x...',
+    bass:  '0.....................0.........3.................2.....0.......'
+  }
+};
+let bandGroove = null;  // name of the groove this phone plays, or null
+let grooveCursor = 0;
+let grooveOut = null;   // { full, soft } gain nodes
+let grooveBassSrc = null;
+
+function grooveNodes() {
+  if (grooveOut) return grooveOut;
+  const ctx = getCtx();
+  const full = ctx.createGain(), soft = ctx.createGain();
+  soft.gain.value = 0.45;
+  full.connect(ctx.destination); soft.connect(ctx.destination);
+  grooveOut = { full: full, soft: soft };
+  return grooveOut;
+}
+
+function grooveHit(id, when, soft, rate, until) {
+  const buf = renderedSounds && renderedSounds[id];
+  if (!buf) return null;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  if (rate) src.playbackRate.value = rate;
+  src.connect(soft ? grooveOut.soft : grooveOut.full);
+  src.start(when);
+  if (until) src.stop(until);
+  return src;
+}
+
+// Runs many times a second next to bandTick. Schedules every step of the groove that begins inside the next short window.
+function grooveTick() {
+  if (!bandGroove || !audioCtx || !bandLocked() || !renderedSounds) { grooveCursor = 0; return; }
+  const pat = GROOVES[bandGroove];
+  if (!pat) return;
+  grooveNodes();
+  const level = parseInt(volPlayback.value) / 100;
+  grooveOut.full.gain.value = level;
+  grooveOut.soft.gain.value = level * 0.45;
+  const sNow = bandClock.now(), sHorizon = sNow + 150;
+  if (grooveCursor < sNow - 50 || grooveCursor > sHorizon) grooveCursor = sNow;
+  const root = GROOVE_ROOTS[(bandRoom.pending || bandRoom).groove] || 0;
+  for (let bar = Math.max(bandBarAt(bandRoom, grooveCursor), bandRoom.barOffset); bandBarTime(bandRoom, bar) < sHorizon; bar++) {
+    const t0 = bandBarTime(bandRoom, bar), stepMs = bandBarMs(bandTempoAt(bandRoom, bar)) / 32;
+    const half = ((bar % 2) + 2) % 2;
+    for (let k = 0; k < 32; k++) {
+      const t = t0 + k * stepMs;
+      if (t < grooveCursor || t >= sHorizon) continue;
+      const i = half * 32 + k;
+      const when = Math.max(audioCtx.currentTime, bandAudioAt(t));
+      Object.keys(pat).forEach(track => {
+        const c = pat[track][i];
+        if (!c || c === '.') return;
+        if (track === 'bass') {
+          const deg = GROOVE_SCALE[+c] || 0;
+          const rate = Math.pow(2, (root + deg) / 12);
+          // The sub bass is one voice: a new note cuts the one before it.
+          if (grooveBassSrc) { try { grooveBassSrc.stop(when + 0.01); } catch (e) {} }
+          grooveBassSrc = grooveHit('bass2', when, false, rate, when + Math.min(0.85, stepMs * 12 / 1000));
+        } else {
+          grooveHit(track, when, c === 'o');
+        }
+      });
+    }
+  }
+  grooveCursor = sHorizon;
+}
+
+function setGroove(name) {
+  getCtx();
+  if (!renderedSounds) preRenderSounds();
+  bandGroove = name && GROOVES[name] ? name : null;
+  grooveCursor = 0;
+  if (bandGroove) {
+    bandJoined = true;
+    if (bandReady() && !bandRoom.playing) bandSync.send('transport', { action: 'start' });
+    bandBeat();
+  }
+  try { localStorage.setItem('looper-band-groove', bandGroove || ''); } catch (e) {}
+  renderGrooves();
+  renderBand();
+}
+
+function renderGrooves() {
+  document.querySelectorAll('#band-grooves .band-chip').forEach(b => b.classList.toggle('on', (b.dataset.g || null) === bandGroove));
+}
+
 // A phone that is playing and on screen tells the server every 10 seconds. With no player the server stops the loop.
 function bandBeat() {
   if ((bandJoined || state === 'playing' || state === 'overdub' || state === 'recording') && bandSync.status === 'live' && document.visibilityState === 'visible') bandSync.send('beat');
@@ -1907,7 +2055,7 @@ function renderBand() {
   let text = st === 'off' ? 'band off' : st === 'no room' ? 'type a room code' : st;
   if (st === 'live') {
     text = bandPhones + (bandPhones === 1 ? ' phone' : ' phones') + ' in room, ';
-    if (bandRoom && bandRoom.playing) text += 'band playing at ' + bandTempoAt(bandRoom, bandBarAt(bandRoom, bandClock.now())) + ' bpm' + (bandPlay ? ', loop locked to band' : bandJoined ? ', joined, Record lands on the bar lines' : ', PLAY here joins the band');
+    if (bandRoom && bandRoom.playing) text += 'band playing at ' + bandTempoAt(bandRoom, bandBarAt(bandRoom, bandClock.now())) + ' bpm' + (bandPlay ? ', loop locked to band' : bandJoined ? ', joined, Record lands on the bar lines' : ', PLAY here joins the band') + (bandGroove ? ', groove ' + bandGroove : '');
     else text += bandRoom && bandRoom.idle ? 'paused, no player' : 'band stopped, PLAY here starts the band';
   }
   document.getElementById('band-status').textContent = text;
@@ -1943,6 +2091,8 @@ function renderBand() {
     if (!renderedSounds) preRenderSounds();
     if (bandJoined || bandPlay) {
       bandJoined = false;
+      bandGroove = null;
+      renderGrooves();
       if (state === 'recording') stopRecording();
       else if (state === 'overdub') stopOverdub();
       if (bandPlay) stopPlayback();
@@ -1955,6 +2105,17 @@ function renderBand() {
     bandBeat();
     renderBand();
   });
+  const grooveBox = document.getElementById('band-grooves');
+  ['OFF'].concat(Object.keys(GROOVES)).forEach(name => {
+    const b = document.createElement('button');
+    b.className = 'band-chip';
+    b.textContent = name;
+    if (name !== 'OFF') b.dataset.g = name;
+    b.addEventListener('click', () => setGroove(name === 'OFF' ? null : name));
+    grooveBox.appendChild(b);
+  });
+  renderGrooves();
+  setInterval(grooveTick, 25);
   setInterval(bandTick, 25);
   setInterval(bandBeat, 10000);
   setInterval(renderBand, 1000);
