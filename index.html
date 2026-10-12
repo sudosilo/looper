@@ -3,7 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>LOOPER</title>
+<title>LOOPER v2</title>
+<!--
+  ORANGE PHONE: v2 band sync.
+    Band panel with a room code. Phones that type the same room code share one server clock and one tempo,
+    including phones running other apps on the same server.
+    While the band loop runs, a loop starts on the shared bar line, a new recording is trimmed to whole bars,
+    and each pass of the loop is started fresh from the server clock so it cannot drift.
+    A loop follows tempo changes by changing its playback speed.
+-->
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;600;800&display=swap');
 
@@ -179,6 +187,40 @@
     color: var(--dim);
     margin-top: 3px;
   }
+
+  /* ORANGE PHONE: v2 band panel */
+  .band-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .band-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .band-room {
+    background: var(--panel-hi);
+    border: 1px solid var(--border);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 7px 10px;
+    border-radius: 4px;
+    width: 150px;
+  }
+  .band-text { font-family: var(--mono); font-size: 0.68rem; color: var(--text); letter-spacing: 0.04em; }
+  .band-btn {
+    background: var(--panel-hi);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.9rem;
+    width: 36px; height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .band-trim { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); min-width: 58px; text-align: center; }
 
   /* SECTION LABEL */
   .section-label {
@@ -539,6 +581,24 @@
     </div>
   </div>
 
+  <!-- BAND -->
+  <div id="band-wrap" hidden>
+    <div class="section-label" style="margin-bottom:10px">Band</div>
+    <div class="band-box">
+      <div class="band-row">
+        <input type="text" class="band-room" id="band-room" maxlength="24" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="room code" aria-label="Room code">
+        <span class="band-text" id="band-clock">clock off</span>
+      </div>
+      <div class="band-row"><span class="band-text" id="band-status">band off</span></div>
+      <div class="band-row">
+        <span class="band-text">TIMING</span>
+        <button class="band-btn" id="band-trim-dn" aria-label="Play earlier">-</button>
+        <span class="band-trim" id="band-trim">0 ms</span>
+        <button class="band-btn" id="band-trim-up" aria-label="Play later">+</button>
+      </div>
+    </div>
+  </div>
+
   <!-- WAVEFORM -->
   <div class="waveform-wrap">
     <canvas id="waveform" height="50"></canvas>
@@ -624,6 +684,9 @@
 
 </div><!-- /main -->
 
+<script src="looper-v2-config.js"></script>
+<script src="looper-v2-sync.js"></script>
+<script src="looper-v2-clock.js"></script>
 <script>
 // ============================================================
 //  AUDIO CONTEXT
@@ -1204,7 +1267,9 @@ function firePad(id, el) {
   src.start();
 
   if (state === 'recording' || state === 'overdub') {
-    recEvents.push({ soundId: id, time: ctx.currentTime - recSessionStart });
+    // ORANGE PHONE: v2 while the band plays the loop, a tap is filed at the spot of the loop it landed on
+    const when = bandPlay ? bandPos() : ctx.currentTime - recSessionStart;
+    if (when != null) recEvents.push({ soundId: id, time: when });
   }
 }
 
@@ -1403,6 +1468,14 @@ function startRecording() {
   const ctx = getCtx();
   recEvents = [];
   recSessionStart = ctx.currentTime;
+  // ORANGE PHONE: v2 while the band loop runs, the recording counts from the bar line just passed
+  bandRec = null;
+  if (bandLocked()) {
+    const bar = bandBarAt(bandRoom, bandClock.now());
+    bandRec = { bar: bar, tempo: bandTempoAt(bandRoom, bar) };
+    recSessionStart = bandAudioAt(bandBarTime(bandRoom, bar));
+    bandBeat();
+  }
   state = 'recording';
   updateStatus();
   updateButtons();
@@ -1410,7 +1483,7 @@ function startRecording() {
 
 function stopRecording() {
   const ctx = getCtx();
-  const duration = ctx.currentTime - recSessionStart;
+  let duration = ctx.currentTime - recSessionStart;
 
   if (recEvents.length === 0 || duration < 0.05) {
     state = slots[activeSlot].buffer ? 'paused' : 'idle';
@@ -1419,10 +1492,23 @@ function stopRecording() {
     return;
   }
 
+  // ORANGE PHONE: v2 a recording made with the band is trimmed to whole bars
+  let bars = 0, anchor = null;
+  if (bandRec) {
+    const barSec = bandBarMs(bandRec.tempo) / 1000;
+    bars = Math.max(1, Math.round(duration / barSec));
+    duration = bars * barSec;
+    anchor = bandRec.bar;
+    recEvents.forEach(e => { e.time = ((e.time % duration) + duration) % duration; });
+    bandRec = null;
+  }
+
   const rendered = renderEvents(recEvents, duration, 1.0);
   slots[activeSlot].undoStack = [];
   slots[activeSlot].buffer   = rendered;
   slots[activeSlot].duration = duration;
+  slots[activeSlot].bars     = bars;
+  slots[activeSlot].anchor   = anchor;
   loopDuration = duration;
 
   refreshSlot(activeSlot);
@@ -1523,6 +1609,9 @@ function startPlayback() {
   if (!slots[activeSlot].buffer) return;
   stopPlayback(false);
 
+  // ORANGE PHONE: v2 in a room the band clock starts the loop
+  if (bandReady()) { bandStartPlayback(); return; }
+
   const ctx = getCtx();
   const gain = ctx.createGain();
   gain.gain.value = parseInt(volPlayback.value) / 100;
@@ -1543,6 +1632,7 @@ function startPlayback() {
 
 function stopPlayback(updateSt=true) {
   if (playbackSource) { try { playbackSource.stop(); } catch(e) {} playbackSource = null; }
+  if (bandPlay) { bandPlay.sources.forEach(src => { try { src.stop(); } catch(e) {} }); bandPlay = null; }
   stopDrawLoop();
   drawProgress(0);
   if (updateSt) {
@@ -1622,11 +1712,11 @@ function drawTick() {
   if (ctx && (state === 'playing' || state === 'overdub')) {
     const dur = slots[activeSlot].buffer ? slots[activeSlot].buffer.duration : 0;
     if (dur > 0) {
-      const elapsed = (ctx.currentTime - loopStartTime) % dur;
+      const elapsed = bandPlay ? (bandPos() || 0) : (ctx.currentTime - loopStartTime) % dur;
       drawProgress(elapsed / dur);
       timeCur.textContent   = fmtTime(elapsed);
       timeTotal.textContent = fmtTime(dur);
-      const lc = Math.floor((ctx.currentTime - loopStartTime) / dur);
+      const lc = bandPlay ? bandPlay.count : Math.floor((ctx.currentTime - loopStartTime) / dur);
       if (lc !== loopCount) { loopCount = lc; loopCountEl.textContent = lc; }
     }
   }
@@ -1665,6 +1755,176 @@ btnOverdub.addEventListener('click', () => { getCtx(); startOverdub(); });
 btnUndo.addEventListener('click', undoOverdub);
 btnClear.addEventListener('click', clearSlot);
 btnDownload.addEventListener('click', exportWav);
+
+// ============================================================
+//  BAND SYNC
+//  ORANGE PHONE: v2 shared room on the sync server. The server sends a clock and a loop state:
+//  tempo, epoch (server time where bar barOffset begins) and a pending change that lands on a bar line.
+// ============================================================
+
+const BAND_URL = (window.LOOPER_CONFIG && window.LOOPER_CONFIG.syncUrl) || '';
+let bandRoom = null;
+let bandPhones = 0;
+let bandTrim = 0;
+let bandPlay = null;   // the loop the band clock is playing right now, or null
+let bandRec = null;    // set while a recording counts from a band bar line
+
+const bandBarMs = tempo => 240000 / tempo;
+function bandPendingAt(s) { return s.epoch + (s.pending.atBar - s.barOffset) * bandBarMs(s.tempo); }
+function bandBarTime(s, bar) {
+  if (s.pending && bar >= s.pending.atBar) return bandPendingAt(s) + (bar - s.pending.atBar) * bandBarMs(s.pending.tempo);
+  return s.epoch + (bar - s.barOffset) * bandBarMs(s.tempo);
+}
+function bandBarAt(s, t) {
+  if (s.pending) { const at = bandPendingAt(s); if (t >= at) return s.pending.atBar + Math.floor((t - at) / bandBarMs(s.pending.tempo)); }
+  return s.barOffset + Math.floor((t - s.epoch) / bandBarMs(s.tempo));
+}
+function bandTempoAt(s, bar) { return s.pending && bar >= s.pending.atBar ? s.pending.tempo : s.tempo; }
+
+const bandClock = createServerClock({
+  send: m => bandSync.send(m.type, m),
+  onChange: () => renderBand()
+});
+const bandSync = createBoardSync({
+  app: 'looper', schema: 1, url: BAND_URL,
+  exportState: () => null, loadState: () => false, applyChange: () => {},
+  onStatus: s => {
+    if (s === 'live') { bandClock.start(); bandBeat(); }
+    else { bandClock.stop(); bandRoom = null; if (bandPlay) stopPlayback(); }
+    renderBand();
+  }
+});
+bandSync.on('pong', m => bandClock.pong(m));
+bandSync.on('loop', m => {
+  const s = m.state;
+  bandRoom = s && typeof s.tempo === 'number' && s.tempo > 0 && typeof s.epoch === 'number' ? s : null;
+  bandPhones = m.phones || 0;
+  // The band stopped while this phone was playing along, so this loop stops too.
+  if (bandPlay && bandPlay.sawPlaying && !(bandRoom && bandRoom.playing) && state === 'playing') stopPlayback();
+  renderBand();
+});
+
+// In a room with a locked clock.
+function bandReady() { return !!(bandRoom && bandSync.status === 'live' && bandClock.synced); }
+// In a room whose loop is running.
+function bandLocked() { return bandReady() && bandRoom.playing; }
+
+// Server time in milliseconds to a time on this phone's audio clock.
+function bandAudioAt(serverMs) {
+  const late = (bandTrim - 1000 * (audioCtx.outputLatency || 0)) / 1000;
+  return audioCtx.currentTime + (serverMs - bandClock.now()) / 1000 + late;
+}
+
+function bandStartPlayback() {
+  const ctx = getCtx();
+  const gain = ctx.createGain();
+  gain.gain.value = parseInt(volPlayback.value) / 100;
+  gain.connect(ctx.destination);
+  bandPlay = { slot: slots[activeSlot], gain: gain, sources: [], marks: [], cursor: 0, first: true, sawPlaying: false, count: 0, tempo: 0 };
+  if (!bandRoom.playing) bandSync.send('transport', { action: 'start' });
+  if (state !== 'overdub') state = 'playing';
+  bandBeat();
+  updateStatus();
+  updateButtons();
+  startDrawLoop();
+  renderBand();
+}
+
+// Runs many times a second. Starts one pass of the loop on each bar line where a pass begins.
+function bandTick() {
+  const p = bandPlay;
+  if (!p || !audioCtx || !bandLocked() || !p.slot.buffer) return;
+  p.sawPlaying = true;
+  const slot = p.slot;
+  const sNow = bandClock.now(), sHorizon = sNow + 150;
+  if (p.cursor < sNow - 50 || p.cursor > sHorizon) p.cursor = sNow;
+  // A loop recorded without the band is fitted to the nearest whole number of bars.
+  if (!slot.bars) slot.bars = Math.max(1, Math.round(slot.duration / (bandBarMs(bandTempoAt(bandRoom, bandBarAt(bandRoom, sNow))) / 1000)));
+  for (let bar = Math.max(bandBarAt(bandRoom, p.cursor), bandRoom.barOffset); bandBarTime(bandRoom, bar) < sHorizon; bar++) {
+    const t = bandBarTime(bandRoom, bar);
+    if (t < p.cursor) continue;
+    if (slot.anchor == null) slot.anchor = bar;
+    const k = (((bar - slot.anchor) % slot.bars) + slot.bars) % slot.bars;
+    const tempo = bandTempoAt(bandRoom, bar);
+    const rate = slot.duration / (slot.bars * bandBarMs(tempo) / 1000);
+    const when = Math.max(audioCtx.currentTime, bandAudioAt(t));
+    const offset = k * slot.duration / slot.bars;
+    if (k === 0 || p.first) {
+      const src = audioCtx.createBufferSource();
+      src.buffer = slot.buffer;
+      src.playbackRate.value = rate;
+      src.connect(p.gain);
+      src.start(when, offset);
+      src.onended = () => { const i = p.sources.indexOf(src); if (i >= 0) p.sources.splice(i, 1); };
+      p.sources.push(src);
+      p.marks.push({ when: when, rate: rate, offset: offset });
+      if (k === 0 && !p.first) p.count++;
+      p.first = false;
+    } else if (tempo !== p.tempo && p.sources.length) {
+      // The tempo changed inside a long loop, so the pass that is sounding changes speed on this bar line.
+      p.sources[p.sources.length - 1].playbackRate.setValueAtTime(rate, when);
+      p.marks.push({ when: when, rate: rate, offset: offset });
+    }
+    p.tempo = tempo;
+    if (p.marks.length > 12) p.marks.shift();
+  }
+  p.cursor = sHorizon;
+}
+
+// Where in the loop the sound is right now, in seconds of the recording. Null before the first pass starts.
+function bandPos() {
+  const p = bandPlay;
+  if (!p || !audioCtx) return null;
+  const now = audioCtx.currentTime;
+  for (let i = p.marks.length - 1; i >= 0; i--) {
+    const m = p.marks[i];
+    if (m.when <= now) return (m.offset + (now - m.when) * m.rate) % p.slot.duration;
+  }
+  return null;
+}
+
+// A phone that is playing and on screen tells the server every 10 seconds. With no player the server stops the loop.
+function bandBeat() {
+  if ((state === 'playing' || state === 'overdub' || state === 'recording') && bandSync.status === 'live' && document.visibilityState === 'visible') bandSync.send('beat');
+}
+
+function renderBand() {
+  const st = bandSync.status;
+  let text = st === 'off' ? 'band off' : st === 'no room' ? 'type a room code' : st;
+  if (st === 'live') {
+    text = bandPhones + (bandPhones === 1 ? ' phone' : ' phones') + ' in room, ';
+    if (bandRoom && bandRoom.playing) text += 'band playing at ' + bandTempoAt(bandRoom, bandBarAt(bandRoom, bandClock.now())) + ' bpm' + (bandPlay ? ', loop locked to band' : ', Play starts the loop on the next bar');
+    else text += bandRoom && bandRoom.idle ? 'paused, no player' : 'band stopped, Play starts the band';
+  }
+  document.getElementById('band-status').textContent = text;
+  document.getElementById('band-clock').textContent = bandClock.synced ? 'clock locked, trip ' + Math.round(bandClock.rtt) + ' ms' : 'clock off';
+}
+
+(function initBand() {
+  if (!BAND_URL) return;
+  document.getElementById('band-wrap').hidden = false;
+  const roomEl = document.getElementById('band-room');
+  roomEl.value = bandSync.room;
+  roomEl.addEventListener('change', () => { roomEl.value = bandSync.setRoom(roomEl.value); });
+  roomEl.addEventListener('keydown', e => { if (e.key === 'Enter') roomEl.blur(); });
+  const trimEl = document.getElementById('band-trim');
+  function setTrim(ms) {
+    bandTrim = Math.min(300, Math.max(-300, Math.round(ms) || 0));
+    try { localStorage.setItem('looper-band-trim', String(bandTrim)); } catch (e) {}
+    trimEl.textContent = (bandTrim > 0 ? '+' : '') + bandTrim + ' ms';
+  }
+  let saved = 0;
+  try { saved = +localStorage.getItem('looper-band-trim'); } catch (e) {}
+  setTrim(saved);
+  document.getElementById('band-trim-dn').addEventListener('click', () => setTrim(bandTrim - 5));
+  document.getElementById('band-trim-up').addEventListener('click', () => setTrim(bandTrim + 5));
+  setInterval(bandTick, 25);
+  setInterval(bandBeat, 10000);
+  setInterval(renderBand, 1000);
+  document.addEventListener('visibilitychange', bandBeat);
+  bandSync.connect();
+  renderBand();
+})();
 
 // ============================================================
 //  UTILS
