@@ -220,6 +220,18 @@
     border-radius: 4px;
     cursor: pointer;
   }
+  .band-go {
+    background: var(--panel-hi);
+    border: 1px solid var(--green);
+    color: var(--green);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 7px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    min-width: 92px;
+  }
+  .band-go.on { border-color: var(--blue); color: var(--blue); }
   .band-trim { font-family: var(--mono); font-size: 0.72rem; color: var(--accent); min-width: 58px; text-align: center; }
 
   /* SECTION LABEL */
@@ -586,6 +598,7 @@
     <div class="section-label" style="margin-bottom:10px">Band</div>
     <div class="band-box">
       <div class="band-row">
+        <button class="band-go" id="band-play">&#9654; PLAY</button>
         <input type="text" class="band-room" id="band-room" maxlength="24" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="room code" aria-label="Room code">
         <span class="band-text" id="band-clock">clock off</span>
       </div>
@@ -1768,6 +1781,7 @@ let bandPhones = 0;
 let bandTrim = 0;
 let bandPlay = null;   // the loop the band clock is playing right now, or null
 let bandRec = null;    // set while a recording counts from a band bar line
+let bandJoined = false; // ORANGE PHONE: v2 set by the Band panel PLAY button, this phone counts as a player
 
 const bandBarMs = tempo => 240000 / tempo;
 function bandPendingAt(s) { return s.epoch + (s.pending.atBar - s.barOffset) * bandBarMs(s.tempo); }
@@ -1885,7 +1899,7 @@ function bandPos() {
 
 // A phone that is playing and on screen tells the server every 10 seconds. With no player the server stops the loop.
 function bandBeat() {
-  if ((state === 'playing' || state === 'overdub' || state === 'recording') && bandSync.status === 'live' && document.visibilityState === 'visible') bandSync.send('beat');
+  if ((bandJoined || state === 'playing' || state === 'overdub' || state === 'recording') && bandSync.status === 'live' && document.visibilityState === 'visible') bandSync.send('beat');
 }
 
 function renderBand() {
@@ -1893,10 +1907,14 @@ function renderBand() {
   let text = st === 'off' ? 'band off' : st === 'no room' ? 'type a room code' : st;
   if (st === 'live') {
     text = bandPhones + (bandPhones === 1 ? ' phone' : ' phones') + ' in room, ';
-    if (bandRoom && bandRoom.playing) text += 'band playing at ' + bandTempoAt(bandRoom, bandBarAt(bandRoom, bandClock.now())) + ' bpm' + (bandPlay ? ', loop locked to band' : ', Play starts the loop on the next bar');
-    else text += bandRoom && bandRoom.idle ? 'paused, no player' : 'band stopped, Play starts the band';
+    if (bandRoom && bandRoom.playing) text += 'band playing at ' + bandTempoAt(bandRoom, bandBarAt(bandRoom, bandClock.now())) + ' bpm' + (bandPlay ? ', loop locked to band' : bandJoined ? ', joined, Record lands on the bar lines' : ', PLAY here joins the band');
+    else text += bandRoom && bandRoom.idle ? 'paused, no player' : 'band stopped, PLAY here starts the band';
   }
   document.getElementById('band-status').textContent = text;
+  const go = document.getElementById('band-play');
+  const on = bandJoined || !!bandPlay;
+  go.textContent = on ? '\u25A0 STOP' : '\u25B6 PLAY';
+  go.classList.toggle('on', on);
   document.getElementById('band-clock').textContent = bandClock.synced ? 'clock locked, trip ' + Math.round(bandClock.rtt) + ' ms' : 'clock off';
 }
 
@@ -1918,6 +1936,25 @@ function renderBand() {
   setTrim(saved);
   document.getElementById('band-trim-dn').addEventListener('click', () => setTrim(bandTrim - 5));
   document.getElementById('band-trim-up').addEventListener('click', () => setTrim(bandTrim + 5));
+  // ORANGE PHONE: v2 the Band panel PLAY button works with or without a recorded loop.
+  // It starts the band when it is stopped, and plays the loop of the open slot on the band clock when there is one.
+  document.getElementById('band-play').addEventListener('click', () => {
+    getCtx();
+    if (!renderedSounds) preRenderSounds();
+    if (bandJoined || bandPlay) {
+      bandJoined = false;
+      if (state === 'recording') stopRecording();
+      else if (state === 'overdub') stopOverdub();
+      if (bandPlay) stopPlayback();
+      renderBand();
+      return;
+    }
+    bandJoined = true;
+    if (bandReady() && !bandRoom.playing) bandSync.send('transport', { action: 'start' });
+    if (slots[activeSlot].buffer && state !== 'recording') startPlayback();
+    bandBeat();
+    renderBand();
+  });
   setInterval(bandTick, 25);
   setInterval(bandBeat, 10000);
   setInterval(renderBand, 1000);
